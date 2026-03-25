@@ -1,0 +1,353 @@
+# 07 · 系统架构与工程化
+
+> 模块 G — Nice to Know
+
+---
+
+## 本模块解决什么工程问题
+
+功能设计好了，评估体系建起来了，高级检索也会了。现在面临的是不一样的一类问题：
+
+- 市场部更新了产品手册，新版本如何同步到向量库？不能每次都全量重建。
+- 员工高峰期同时提交 100 个问题，系统怎么扛住？
+- 同一个问题被问了 200 遍，每次都调 LLM 太贵了。
+- 系统突然回答质量下降，怎么快速定位是哪个环节出了问题？
+
+**本模块解决的是 RAG 系统从"能用"到"好用、稳定、可维护"的工程化问题。**
+
+---
+
+## 知识点 1：索引更新策略
+
+### 全量重建的问题
+
+最简单的做法：有文档更新，把整个向量库删掉，重新对所有文档建索引。
+
+**问题：**
+- 时间成本：数百份文档重建可能需要数小时
+- 期间系统不可用或使用旧版数据
+- 不必要的重复计算：99% 的文档没变
+
+### 增量更新策略
+
+只处理变更的文档，分三种操作：
+
+```python
+# 伪代码：增量更新核心逻辑
+def incremental_update(doc_changes):
+    for change in doc_changes:
+        if change.type == "new":
+            # 新文档：切块 → 向量化 → 插入向量库
+            chunks = chunk_document(change.doc)
+            vectors = embed_batch(chunks)
+            vector_db.insert(vectors, metadata={"source": change.doc.id})
+        
+        elif change.type == "updated":
+            # 更新文档：删除旧块 → 处理新版本 → 插入
+            vector_db.delete(filter={"source": change.doc.id})  # 删旧
+            chunks = chunk_document(change.doc)
+            vectors = embed_batch(chunks)
+            vector_db.insert(vectors, metadata={"source": change.doc.id})
+        
+        elif change.type == "deleted":
+            # 删除文档：从向量库移除对应块
+            vector_db.delete(filter={"source": change.doc.id})
+```
+
+**实现增量更新的前提：** 每个 chunk 的元数据里必须有 `source_file`（文件标识符），这样才能按来源精准删除旧块。这也是模块 B 强调元数据管理的工程原因之一。
+
+### 文档变更检测
+
+**方法一：文件哈希对比**
+```python
+# 伪代码
+def detect_changes(doc_folder, hash_store):
+    changes = []
+    for doc in scan_folder(doc_folder):
+        current_hash = md5(doc.content)
+        stored_hash = hash_store.get(doc.id)
+        
+        if stored_hash is None:
+            changes.append(Change(type="new", doc=doc))
+        elif current_hash != stored_hash:
+            changes.append(Change(type="updated", doc=doc))
+    
+    # 找被删除的文档
+    for doc_id in hash_store.keys():
+        if not exists_in_folder(doc_id):
+            changes.append(Change(type="deleted", doc_id=doc_id))
+    
+    return changes
+```
+
+**方法二：接入文档系统的 Webhook**
+如果文档存在 Confluence、SharePoint 等平台，监听其变更事件，触发增量更新。比轮询更高效。
+
+**在贯穿案例里的建议：** 用定时任务每天凌晨扫描一次文档目录，检测变更，执行增量更新。对于紧急的重要文档更新，提供一个手动触发的更新接口。
+
+---
+
+## 知识点 2：缓存机制
+
+### 为什么需要缓存
+
+RAG 的每次查询包含：
+1. Embedding 模型调用（问题向量化）
+2. 向量数据库检索
+3. Reranker 调用（如果有）
+4. LLM 调用（最贵）
+
+对于重复问题，以上步骤完全没必要重复执行。
+
+**在贯穿案例里：** "OAuth token 怎么获取"这个问题可能每天被问 50 次。每次都调用 LLM，每次约 0.01-0.05 美元，50 次就是 0.5-2.5 美元，一年下来成本不小。
+
+### 两层缓存架构
+
+#### 第一层：精确匹配缓存
+
+完全相同的问题，直接返回缓存的回答。
+
+```python
+import hashlib
+import redis
+
+def query_with_cache(question):
+    # 生成问题的缓存 key
+    cache_key = f"rag:exact:{hashlib.md5(question.encode()).hexdigest()}"
+    
+    # 检查缓存
+    cached = redis.get(cache_key)
+    if cached:
+        return json.loads(cached)
+    
+    # 没有缓存，走完整 RAG 流程
+    result = full_rag_pipeline(question)
+    
+    # 存入缓存，TTL 24小时
+    redis.setex(cache_key, 86400, json.dumps(result))
+    return result
+```
+
+**局限：** 只能命中完全相同的问题，"OAuth token 怎么获取"和"怎么获取 OAuth token"是不同的 key，缓存命中率低。
+
+#### 第二层：语义缓存
+
+对问题做 Embedding，在缓存库里找语义相似的历史问题，相似度超过阈值就返回缓存结果。
+
+```python
+def semantic_cache_lookup(question, threshold=0.95):
+    question_vector = embed(question)
+    
+    # 在缓存向量库里找最相似的历史问题
+    similar = cache_vector_db.search(question_vector, top_k=1)
+    
+    if similar and similar[0].score > threshold:
+        return cache_store.get(similar[0].id)  # 返回缓存回答
+    
+    return None  # 缓存未命中，走完整流程
+```
+
+→ **术语注解：语义缓存（Semantic Cache）**，GPTCache 是这个领域的开源实现，可以直接集成。
+
+**在贯穿案例里的建议：** 先只做精确缓存（实现简单），监控命中率。如果命中率低于 30%，再考虑语义缓存。
+
+---
+
+## 知识点 3：异步处理与并发
+
+### 同步架构的瓶颈
+
+```
+用户A 提问 → 等待检索+LLM（2秒）→ 收到回答
+用户B 提问 → 排队等待A完成 → 等待检索+LLM（2秒）→ 收到回答
+```
+
+同步处理在并发场景下线性累积延迟，高峰期体验很差。
+
+### 异步处理架构
+
+```
+用户A 提问 → 立即返回"处理中，任务ID=xxx"
+用户B 提问 → 立即返回"处理中，任务ID=yyy"
+
+[Worker 池]
+  Worker1 处理任务xxx（检索+LLM）
+  Worker2 处理任务yyy（检索+LLM）
+
+用户A 轮询或 WebSocket 获取结果
+用户B 轮询或 WebSocket 获取结果
+```
+
+**在贯穿案例里的简单实现：**
+
+```python
+# 使用 Celery + Redis 的伪代码
+
+@celery.task
+def rag_task(question, session_id):
+    result = full_rag_pipeline(question)
+    redis.setex(f"result:{session_id}", 300, json.dumps(result))
+    return result
+
+# API 层
+@app.post("/query")
+def query(request):
+    session_id = generate_id()
+    rag_task.delay(request.question, session_id)  # 异步提交
+    return {"session_id": session_id, "status": "processing"}
+
+@app.get("/result/{session_id}")
+def get_result(session_id):
+    result = redis.get(f"result:{session_id}")
+    if result:
+        return {"status": "done", "result": json.loads(result)}
+    return {"status": "processing"}
+```
+
+**流式输出（Streaming）：** LLM 支持流式返回，可以一边生成一边推送给用户，减少"等待感"。用 Server-Sent Events（SSE）或 WebSocket 实现。
+
+---
+
+## 知识点 4：可观测性与监控
+
+### 为什么可观测性在 RAG 里特别重要
+
+普通 API 出了问题，日志里看请求和响应就能定位。RAG 系统出了问题，问题可能在：
+- Embedding 模型（向量偏了）
+- 分块策略（块切错了）
+- 检索（找错了内容）
+- Reranker（排错了顺序）
+- LLM（幻觉或误读）
+- Prompt 模板（约束没生效）
+
+**没有足够的可观测性，RAG 系统是个黑盒，出问题无从排查。**
+
+### 必须记录的日志字段
+
+```python
+# 每次查询的完整日志
+log = {
+    "timestamp": "2024-11-15T10:23:45",
+    "session_id": "abc123",
+    "question": "OAuth token 怎么获取",
+    "rewritten_query": "OAuth 2.0 access_token 获取方法",   # 查询改写后
+    
+    # 检索结果
+    "retrieved_chunks": [
+        {"chunk_id": "42", "source": "API文档v2.3", "score": 0.89},
+        {"chunk_id": "18", "source": "FAQ.md", "score": 0.85},
+    ],
+    "reranked_chunks": ["42", "18", "91"],   # Reranker 重排后的顺序
+    
+    # 生成结果
+    "llm_model": "claude-sonnet-4-20250514",
+    "prompt_tokens": 1243,
+    "completion_tokens": 287,
+    "latency_ms": {
+        "embedding": 45,
+        "retrieval": 23,
+        "reranking": 180,
+        "llm": 1840,
+        "total": 2088
+    },
+    "answer": "调用 POST /auth/token 接口...",
+    
+    # 用户反馈（异步收集）
+    "user_feedback": "helpful"   # 用户点了👍
+}
+```
+
+### 关键监控指标
+
+**性能类：**
+- P50/P95/P99 延迟（总体 + 各阶段分解）
+- LLM token 消耗量（成本监控）
+- 缓存命中率
+
+**质量类（近实时）：**
+- 每日"未找到相关内容"的比例（过高说明检索有问题或文档覆盖不足）
+- 用户反馈满意度（点赞/踩 比率）
+- RAGAS 自动评分（定期批量跑测试集）
+
+**告警规则：**
+```
+P95 延迟 > 5秒    → 告警：系统响应过慢
+"未找到"比例 > 30% → 告警：检索质量下降
+日均报错 > 1%     → 告警：系统异常
+```
+
+→ **术语注解：P95 延迟**，第 95 百分位的响应时间——100 个请求里最慢的那 5 个之外，最慢的那个。比平均延迟更能代表用户体验（因为大多数用户看到的是 P95 以内的延迟）。
+
+---
+
+## 知识点 5：整体系统架构
+
+把所有模块串起来，形成一个完整的生产级架构视图：
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │           离线流水线（Indexing）          │
+                    │                                         │
+  文档变更 ──────→  │  文档加载 → 分块 → Embedding → 向量库   │
+  (定时/Webhook)    │                      ↑元数据             │
+                    │                   Hash存储（变更检测）   │
+                    └─────────────────────────────────────────┘
+                                          ↓（向量库）
+                    ┌─────────────────────────────────────────┐
+                    │           在线流水线（Query）             │
+                    │                                         │
+  用户提问 ─→ 路由 → │  查询改写 → 混合检索 → Reranking →     │
+             判断   │  Context构建 → LLM → 引用溯源 → 回答    │
+                    │       ↑缓存命中直接返回                  │
+                    └─────────────────────────────────────────┘
+                                          ↓（日志）
+                    ┌─────────────────────────────────────────┐
+                    │           可观测性层                      │
+                    │                                         │
+                    │  查询日志 → 性能监控 → 质量评估(RAGAS)   │
+                    │  用户反馈 → 告警规则 → 调优闭环          │
+                    └─────────────────────────────────────────┘
+```
+
+### 技术栈选型建议（贯穿案例）
+
+| 组件 | 建议选型 | 理由 |
+|------|---------|------|
+| 向量库 | Qdrant | 开源自部署，支持混合检索和元数据过滤 |
+| Embedding 模型 | BGE-M3（本地） | 中文表现强，免费，支持稠密+稀疏 |
+| Reranker | BGE-Reranker-v2 | 和 BGE-M3 同系列，中文好 |
+| LLM | Claude Sonnet / GPT-4o | 按成本和效果选择 |
+| 缓存 | Redis | 精确缓存 + 语义缓存结果存储 |
+| 任务队列 | Celery + Redis | 异步处理 |
+| 监控 | Prometheus + Grafana | 指标可视化 |
+| RAG 框架 | LlamaIndex 或 LangChain | 原型和快速开发 |
+
+---
+
+## 模块小结
+
+工程化是让 RAG 从"Demo 能跑"变成"生产可用"的最后一公里。三个核心工程能力：
+
+1. **索引更新**：增量更新，文档变化快速同步，不重建
+2. **缓存机制**：降低重复查询的延迟和成本
+3. **可观测性**：每次查询的完整链路日志，出问题有据可查
+
+---
+
+## 全系列学习总结
+
+你已经走完了 RAG 的完整认知框架：
+
+```
+模块 A：理解 RAG 是什么（两条流水线，四个组件）
+模块 B：文档怎么变成可检索的块（加载、分块、元数据）
+模块 C：从块里找到对的内容（混合检索、Reranking）
+模块 D：把找到的内容组装成高质量 Prompt（你的 CE 能力在这里发力）
+模块 E：用数字衡量系统质量，定位问题在哪（RAGAS、指标体系）
+模块 F：当基础检索不够用时的进阶手段（改写、HyDE、多跳）
+模块 G：让系统在生产环境跑得稳（更新、缓存、监控）
+```
+
+**接下来你已经具备了进入 Knowledge Engineering 的工程直觉：**
+
+你会理解为什么文档质量、结构设计、标注规范，会从根本上影响 RAG 检索效果——这些不是"文档整理的事"，而是决定整个 AI 问答系统上限的基础设施。Knowledge Engineering 就是在系统性地解决这件事。
