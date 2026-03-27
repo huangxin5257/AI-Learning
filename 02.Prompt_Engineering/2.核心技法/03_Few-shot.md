@@ -38,33 +38,33 @@ Few-shot 示例不是在"教知识"，而是在向模型演示任务的接口契
 **Zero-shot（无示例）**
 
 ```text
-System: 你是情感分析助手。
+System: 你是代码仓库 issue 分类助手。
 
-User: 这家餐厅的牛排太老了，完全不值这个价。
+User: crash: NullPointerException in PaymentService when cart is empty
 
-Assistant: 负面情感。这句话提到牛排质量差、性价比低。
+Assistant: 这是一个 bug，支付服务在购物车为空时抛出空指针异常。
 ```
 
 **Few-shot（两个示例）**
 
 ```text
-System: 你是情感分析助手。
+System: 你是代码仓库 issue 分类助手。
 
 User:
 示例 1：
-Input: 外卖送来时已凉了，但口味不错。
-Output: {"label": "mixed", "pos": ["口味"], "neg": ["温度"]}
+Input: fix: JWT token not refreshing after expiry, causes 401 on long sessions
+Output: {"label": "bug", "component": "auth", "severity": "high"}
 
 示例 2：
-Input: 服务员态度好，环境舒适，下次还来。
-Output: {"label": "positive", "pos": ["服务", "环境"], "neg": []}
+Input: docs: update API reference for /v2/users endpoint
+Output: {"label": "docs", "component": "api", "severity": "low"}
 
 现在请分析：
-Input: 这家餐厅的牛排太老了，完全不值这个价。
+Input: crash: NullPointerException in PaymentService when cart is empty
 Output:
 
 Assistant:
-{"label": "negative", "pos": [], "neg": ["食材质量", "性价比"]}
+{"label": "bug", "component": "payment", "severity": "high"}
 ```
 
 **输出对比**：Zero-shot 输出是非结构化自然语言，难以程序解析；Few-shot 输出是可直接 `json.loads()` 的结构化数据。
@@ -123,22 +123,25 @@ Assistant:
 ### ③ 最小可运行示例
 
 ```text
-# 5 个低质量示例（全部是简单正面情感）
-示例 1: Input: 好吃  Output: positive
-示例 2: Input: 很棒  Output: positive
-示例 3: Input: 喜欢  Output: positive
-示例 4: Input: 满意  Output: positive
-示例 5: Input: 赞    Output: positive
+# 5 个低质量示例（全部是同类型的简单成功状态）
+示例 1: Input: tests passed    Output: success
+示例 2: Input: build ok         Output: success
+示例 3: Input: all green        Output: success
+示例 4: Input: pipeline done    Output: success
+示例 5: Input: deploy complete  Output: success
 
-新输入: 这家店的食物还不错，但是价格贵得让我不想再去了（讽刺语气）
-→ 模型输出: positive  ← 错误！被示例分布拉偏
+新输入: "unit tests: 143 passed. Deploy to prod: FAILED – OOM in container"
+→ 模型输出: success  ← 错误！被示例分布拉偏，忽略了 FAILED 关键词
 
-# 2 个高质量示例（覆盖 edge case）
-示例 1: Input: 外卖送来时已凉了，但口味不错。  Output: {"label": "mixed"}
-示例 2: Input: 所谓的"五星大厨"，做出来的东西连食堂都不如。  Output: {"label": "negative"}  # 讽刺
+# 2 个高质量示例（覆盖 edge case：混合结果）
+示例 1: Input: "Unit tests: 142 passed, 0 failed. Deploy: FAILED – DB connection timeout"
+        Output: {"stage": "deploy", "root_cause": "infrastructure", "action": "check DB"}
+示例 2: Input: "Build OK. Tests: 89 passed, 3 FAILED (TestPaymentFlow). Deploy: skipped"
+        Output: {"stage": "test", "root_cause": "code", "action": "fix failing tests"}
 
-新输入: 这家店的食物还不错，但是价格贵得让我不想再去了（讽刺语气）
-→ 模型输出: {"label": "negative"}  ← 正确，理解了讽刺语气
+新输入: "unit tests: 143 passed. Deploy to prod: FAILED – OOM in container"
+→ 模型输出: {"stage": "deploy", "root_cause": "resource", "action": "increase memory limit"}
+← 正确，理解了混合结果并定位到真正的失败点
 ```
 
 ### ④ 适用 vs 不适用场景
@@ -288,24 +291,24 @@ import anthropic
 # 示例库（生产环境中存储在向量数据库）
 EXAMPLE_BANK = [
     {
-        "input": "我的订单三天了还没发货，怎么回事？",
-        "output": '{"category": "物流", "urgency": "high", "action": "查询发货状态"}',
-        "tags": ["物流", "发货", "延迟"]
+        "input": "部署到 production 后 API 返回 502，staging 正常",
+        "output": '{"category": "部署问题", "urgency": "high", "action": "回滚版本 + 检查 nginx 配置"}',
+        "tags": ["部署", "502", "生产环境"]
     },
     {
-        "input": "商品和图片不符，我要退款",
-        "output": '{"category": "退款", "urgency": "high", "action": "发起退款申请"}',
-        "tags": ["退款", "商品不符", "投诉"]
+        "input": "Jenkins pipeline 卡住 30 分钟了，不动了",
+        "output": '{"category": "CI/CD", "urgency": "high", "action": "检查 agent 状态，终止卡死进程"}',
+        "tags": ["Jenkins", "CI", "卡死", "pipeline"]
     },
     {
-        "input": "这个优惠券怎么用？",
-        "output": '{"category": "咨询", "urgency": "low", "action": "引导使用说明"}',
-        "tags": ["优惠券", "咨询", "使用方法"]
+        "input": "怎么给新同事申请 GitHub 仓库的 write 权限",
+        "output": '{"category": "权限申请", "urgency": "low", "action": "提交权限申请单，等 owner 审批"}',
+        "tags": ["权限", "GitHub", "申请"]
     },
     {
-        "input": "快递一直显示在途，联系不到快递员",
-        "output": '{"category": "物流", "urgency": "high", "action": "联系快递公司介入"}',
-        "tags": ["物流", "快递", "失联"]
+        "input": "线上服务 CPU 飙到 95%，告警已触发",
+        "output": '{"category": "线上告警", "urgency": "critical", "action": "立即扩容 + 查日志 + 通知 on-call"}',
+        "tags": ["CPU", "告警", "线上", "紧急"]
     },
 ]
 
@@ -351,7 +354,7 @@ def classify_customer_query(user_query: str) -> str:
             }
         ],
         system=(
-            "你是电商客服工单分类助手。"
+            "你是开发者工单分类助手。"
             "根据用户输入，输出 JSON 格式的分类结果，包含 category、urgency、action 三个字段。"
             "只返回 JSON，不要其他文字。"
         )
@@ -360,7 +363,7 @@ def classify_customer_query(user_query: str) -> str:
 
 
 if __name__ == "__main__":
-    query = "我的包裹显示签收了但我没收到"
+    query = "我的服务今天下午 3 点开始内存一直在涨，已经重启了两次了"
     result = classify_customer_query(query)
     print(f"输入: {query}")
     print(f"输出: {result}")
@@ -421,22 +424,23 @@ Few-shot 的 in-context learning 基于一个隐性假设：**新输入属于示
 ### ③ 最小可运行示例
 
 ```text
-# Few-shot 示例（全部是简单短句）
-示例 1: Input: 好吃  Output: positive
-示例 2: Input: 很差  Output: negative
-示例 3: Input: 一般  Output: neutral
+# Few-shot 示例（全部是单行简单 issue 标题）
+示例 1: Input: 变量命名不规范      Output: style
+示例 2: Input: 缺少注释            Output: docs
+示例 3: Input: 有个拼写错误        Output: style
 
-# 新输入：100 字的复杂技术评测，含混合情感
-Input: 这款降噪耳机的主动降噪效果在同价位中属于前列，低频噪音压制尤其出色，通勤场景下几乎感觉不到地铁噪音。
-       但佩戴舒适度差强人意，长时间使用后耳廓有明显压迫感。音质方面低频量感充足但中高频略显暗淡，
-       对于流行音乐听感尚可，古典乐则稍显不足。综合性价比在 999 元档位属于中等水平。
+# 新输入：复杂多维 code review 意见
+Input: 这段代码在单测里看起来没问题，但在高并发场景，两个线程同时走到
+       if(cache.get(key) == null) 这里，会各自触发数据库查询，造成缓存击穿。
+       同时 catch (Exception e) {} 会吞掉所有异常，上游完全感知不到失败，
+       这在支付流程里是严重安全隐患。
 
 # Zero-shot 输出（无示例）
-分析：该评测呈现明显的混合情感。正面：降噪效果优秀、低频表现好。负面：佩戴舒适度欠佳、中高频表现一般、性价比中等。
-总体倾向：mixed，优点集中于功能性，缺点集中于体验和音质。
+分析：存在两个 critical 问题：1) 并发缓存击穿——应使用分布式锁或 singleflight；
+2) 异常吞噬——catch 块必须记录日志并向上抛出，尤其在支付流程中。严重程度：critical。
 
 # Few-shot 输出（有示例但分布不匹配）
-positive  ← 错误！被简单示例格式锁定，无法输出复杂分析
+style  ← 错误！被简单单行示例锁定，将严重并发 bug 误分类为风格问题
 ```
 
 ### ④ 适用 vs 不适用场景
