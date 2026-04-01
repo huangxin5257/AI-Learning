@@ -345,4 +345,12 @@ ToT 需要编排层（Orchestration）：
                     └── 否 → Zero-shot CoT
                               问题需要探索+回溯吗？
                               └── 是 → Tree of Thoughts（慎用，评估实现成本）
+
+---
+
+## 延伸阅读
+
+本文聚焦于 CoT 的**外部工作记忆机制**（可见中间步骤 → 影响后续 token 预测），以及 Self-Consistency 的现代参数校准（3-5次，而非 GPT-3 时代的 10-20 次）。关于 CoT 和模型思考能力的官方实践：
+
+- [Claude Prompting Best Practices](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/claude-prompting-best-practices) — 重点参考"Leverage thinking & interleaved thinking"和"Self-checking"两节
 ```
